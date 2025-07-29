@@ -191,32 +191,68 @@ class YouTubeSheetsAnalyzer:
             'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
     
-    def write_results_to_sheets(self, results: List[Dict], config: Dict):
-        """Write analysis results to Google Sheets"""
+    def get_existing_channels(self) -> set:
+        """Get all channel IDs that have been previously found"""
         sheet_id = os.environ['GOOGLE_SHEET_ID']
         spreadsheet = self.gc.open_by_key(sheet_id)
+        
+        try:
+            results_sheet = spreadsheet.worksheet('Results')
+            all_data = results_sheet.get_all_values()
+            
+            # Skip header row and extract channel IDs (first column)
+            existing_channels = set()
+            for row in all_data[1:]:  # Skip header
+                if row and len(row) > 0 and row[0]:  # Check if channel ID exists
+                    existing_channels.add(row[0])
+            
+            print(f"Found {len(existing_channels)} existing channels in Results sheet")
+            return existing_channels
+            
+        except gspread.WorksheetNotFound:
+            print("Results sheet not found - this must be the first run")
+            return set()
+        except Exception as e:
+            print(f"Error reading existing channels: {e}")
+            return set()
+
+    def write_results_to_sheets(self, results: List[Dict], config: Dict):
+        """Write only NEW analysis results to Google Sheets"""
+        sheet_id = os.environ['GOOGLE_SHEET_ID']
+        spreadsheet = self.gc.open_by_key(sheet_id)
+        
+        # Get existing channels to avoid duplicates
+        existing_channel_ids = self.get_existing_channels()
         
         # Create or get Results worksheet
         try:
             results_sheet = spreadsheet.worksheet('Results')
-            results_sheet.clear()
         except gspread.WorksheetNotFound:
             results_sheet = spreadsheet.add_worksheet(title='Results', rows=1000, cols=10)
+            # Add headers for new sheet
+            headers = [
+                'Channel ID', 'Channel Title', 'Channel URL', 'Subscriber Count',
+                'Video Count', 'Kids Score', 'Matched Keywords', 'Likely Kids Content',
+                'Analysis Date'
+            ]
+            results_sheet.update('A1', [headers])
         
-        # Filter results based on minimum score
+        # Filter results based on minimum score AND exclude existing channels
         filtered_results = [
             r for r in results 
-            if r.get('kids_content_score', 0) >= config['min_kids_score'] and 'error' not in r
+            if (r.get('kids_content_score', 0) >= config['min_kids_score'] 
+                and 'error' not in r 
+                and r.get('channel_id') not in existing_channel_ids)
         ]
         
-        # Prepare data for sheets
-        headers = [
-            'Channel ID', 'Channel Title', 'Channel URL', 'Subscriber Count',
-            'Video Count', 'Kids Score', 'Matched Keywords', 'Likely Kids Content',
-            'Analysis Date'
-        ]
+        # Only proceed if we have new channels
+        if not filtered_results:
+            print("No new kids channels found - all channels were already in the database")
+            self.update_summary(spreadsheet, len(results), 0, config)
+            return
         
-        data = [headers]
+        # Prepare data for new channels only
+        new_rows = []
         for result in filtered_results:
             row = [
                 result.get('channel_id', ''),
@@ -229,25 +265,36 @@ class YouTubeSheetsAnalyzer:
                 'Yes' if result.get('likely_kids_content', False) else 'No',
                 result.get('analysis_date', '')
             ]
-            data.append(row)
+            new_rows.append(row)
         
-        # Write to sheet
-        results_sheet.update('A1', data)
+        # Append new rows to the existing sheet (don't overwrite)
+        if new_rows:
+            # Find the next empty row
+            all_values = results_sheet.get_all_values()
+            next_row = len(all_values) + 1
+            
+            # Update starting from the next empty row
+            range_name = f'A{next_row}'
+            results_sheet.update(range_name, new_rows)
+            
+            print(f"Added {len(filtered_results)} NEW kids channels to Google Sheets")
         
-        # Update summary in Config sheet
+        # Update summary
+        self.update_summary(spreadsheet, len(results), len(filtered_results), config)
+    
+    def update_summary(self, spreadsheet, total_found: int, new_added: int, config: Dict):
+        """Update the summary section in Config sheet"""
         try:
             config_sheet = spreadsheet.worksheet('Config')
             summary_data = [
                 ['Last Run', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                ['Total Channels Found', len(results)],
-                ['Kids Channels Found', len(filtered_results)],
+                ['Total Channels Analyzed', total_found],
+                ['NEW Kids Channels Added', new_added],
                 ['Search Terms Used', ', '.join(config['search_terms'])]
             ]
             config_sheet.update('D1', summary_data)
-        except:
-            pass
-        
-        print(f"Written {len(filtered_results)} kids channels to Google Sheets")
+        except Exception as e:
+            print(f"Error updating summary: {e}")
     
     def run_analysis(self):
         """Main analysis workflow"""
