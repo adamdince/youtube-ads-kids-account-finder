@@ -328,7 +328,7 @@ class YouTubeSheetsAnalyzer:
             print(f"Error updating summary: {e}")
     
     def run_analysis(self):
-        """Main analysis workflow"""
+        """Main analysis workflow with batch processing"""
         print("Starting YouTube kids channel analysis...")
         
         # Get configuration from sheets
@@ -340,25 +340,135 @@ class YouTubeSheetsAnalyzer:
         # Search for channels using each term
         for term in config['search_terms']:
             print(f"Searching for channels with term: {term}")
-            channel_ids = self.search_channels(term, config['max_results_per_term'])
-            all_channel_ids.update(channel_ids)
-            print(f"Found {len(channel_ids)} channels for '{term}'")
+            try:
+                channel_ids = self.search_channels(term, config['max_results_per_term'])
+                all_channel_ids.update(channel_ids)
+                print(f"Found {len(channel_ids)} channels for '{term}'")
+                
+                # Add small delay to avoid rate limiting
+                import time
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error searching for '{term}': {e}")
+                continue
         
         print(f"Total unique channels to analyze: {len(all_channel_ids)}")
         
-        # Analyze each channel
-        results = []
-        for i, channel_id in enumerate(all_channel_ids):
-            if i % 10 == 0:
-                print(f"Analyzing channel {i+1}/{len(all_channel_ids)}")
+        # Get existing channels to avoid duplicates
+        existing_channel_ids = self.get_existing_channels()
+        
+        # Filter out channels we've already analyzed
+        new_channel_ids = [cid for cid in all_channel_ids if cid not in existing_channel_ids]
+        print(f"New channels to analyze: {len(new_channel_ids)}")
+        
+        if not new_channel_ids:
+            print("No new channels to analyze!")
+            return
+        
+        # Analyze channels in batches and write results frequently
+        batch_size = 100
+        all_results = []
+        
+        for i in range(0, len(new_channel_ids), batch_size):
+            batch = list(new_channel_ids)[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(new_channel_ids) + batch_size - 1) // batch_size
             
-            result = self.analyze_channel(channel_id)
-            results.append(result)
+            print(f"\n--- Processing Batch {batch_num}/{total_batches} ({len(batch)} channels) ---")
+            
+            batch_results = []
+            for j, channel_id in enumerate(batch):
+                global_index = i + j + 1
+                print(f"Analyzing channel {global_index}/{len(new_channel_ids)}")
+                
+                try:
+                    result = self.analyze_channel(channel_id)
+                    batch_results.append(result)
+                    
+                    # Add small delay to avoid rate limiting
+                    import time
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"Error analyzing channel {channel_id}: {e}")
+                    continue
+            
+            # Filter and write this batch to sheets immediately
+            filtered_batch = [
+                r for r in batch_results 
+                if (r.get('kids_content_score', 0) >= config['min_kids_score'] 
+                    and 'error' not in r)
+            ]
+            
+            if filtered_batch:
+                try:
+                    self.write_batch_to_sheets(filtered_batch)
+                    print(f"✅ Wrote {len(filtered_batch)} kids channels from this batch to Google Sheets")
+                except Exception as e:
+                    print(f"❌ Error writing batch to sheets: {e}")
+            
+            all_results.extend(batch_results)
+            
+            print(f"Batch {batch_num} complete. Total channels processed so far: {i + len(batch)}")
         
-        # Write results to sheets
-        self.write_results_to_sheets(results, config)
+        # Update final summary
+        try:
+            sheet_id = os.environ['GOOGLE_SHEET_ID']
+            spreadsheet = self.gc.open_by_key(sheet_id)
+            
+            total_new_added = sum(1 for r in all_results 
+                                if r.get('kids_content_score', 0) >= config['min_kids_score'] 
+                                and 'error' not in r)
+            
+            self.update_summary(spreadsheet, len(all_results), total_new_added, config)
+            print(f"\n🎉 Analysis complete! Added {total_new_added} new kids channels total.")
+            
+        except Exception as e:
+            print(f"Error updating final summary: {e}")
+    
+    def write_batch_to_sheets(self, batch_results: List[Dict]):
+        """Write a batch of results to Google Sheets immediately"""
+        sheet_id = os.environ['GOOGLE_SHEET_ID']
+        spreadsheet = self.gc.open_by_key(sheet_id)
         
-        print("Analysis complete!")
+        # Get or create Results worksheet
+        try:
+            results_sheet = spreadsheet.worksheet('Results')
+        except gspread.WorksheetNotFound:
+            results_sheet = spreadsheet.add_worksheet(title='Results', rows=5000, cols=10)
+            # Add headers for new sheet
+            headers = [
+                'Channel ID', 'Channel Title', 'Channel URL', 'Subscriber Count',
+                'Video Count', 'Kids Score', 'Matched Keywords', 'Likely Kids Content',
+                'Analysis Date'
+            ]
+            results_sheet.update('A1', [headers])
+        
+        # Prepare data for new channels
+        new_rows = []
+        for result in batch_results:
+            row = [
+                result.get('channel_id', ''),
+                result.get('channel_title', ''),
+                result.get('channel_url', ''),
+                result.get('subscriber_count', 0),
+                result.get('video_count', 0),
+                result.get('kids_content_score', 0),
+                result.get('matched_keywords', ''),
+                'Yes' if result.get('likely_kids_content', False) else 'No',
+                result.get('analysis_date', '')
+            ]
+            new_rows.append(row)
+        
+        if new_rows:
+            # Find the next empty row
+            all_values = results_sheet.get_all_values()
+            next_row = len(all_values) + 1
+            
+            # Update starting from the next empty row
+            range_name = f'A{next_row}'
+            results_sheet.update(range_name, new_rows)
 
 if __name__ == "__main__":
     analyzer = YouTubeSheetsAnalyzer()
