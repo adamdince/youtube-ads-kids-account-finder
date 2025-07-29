@@ -77,30 +77,61 @@ class YouTubeSheetsAnalyzer:
             # Fallback defaults
             return {
                 'search_terms': ['kids', 'children', 'nursery rhymes'],
-                'max_results_per_term': 50,
+                'max_results_per_term': 100,
                 'min_kids_score': 3
             }
     
-    def search_channels(self, query: str, max_results: int = 50) -> List[str]:
-        """Search for channels and return channel IDs"""
+    def search_channels(self, query: str, max_results: int = 100) -> List[str]:
+        """Search for channels and return channel IDs with pagination support"""
         url = f"{self.base_url}/search"
-        params = {
-            'part': 'snippet',
-            'type': 'channel',
-            'q': query,
-            'maxResults': max_results,
-            'key': self.youtube_api_key
-        }
-        
-        response = requests.get(url, params=params)
         channel_ids = []
+        next_page_token = None
+        results_per_page = min(50, max_results)  # API max is 50 per request
         
-        if response.status_code == 200:
-            data = response.json()
-            for item in data['items']:
-                channel_ids.append(item['snippet']['channelId'])
+        while len(channel_ids) < max_results:
+            # Calculate how many results we still need
+            remaining_results = max_results - len(channel_ids)
+            current_page_size = min(results_per_page, remaining_results)
+            
+            params = {
+                'part': 'snippet',
+                'type': 'channel',
+                'q': query,
+                'maxResults': current_page_size,
+                'key': self.youtube_api_key
+            }
+            
+            # Add pagination token if we have one
+            if next_page_token:
+                params['pageToken'] = next_page_token
+            
+            try:
+                response = requests.get(url, params=params)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Extract channel IDs from this page
+                    for item in data['items']:
+                        if len(channel_ids) < max_results:
+                            channel_ids.append(item['snippet']['channelId'])
+                    
+                    # Check if there are more pages
+                    next_page_token = data.get('nextPageToken')
+                    
+                    # If no more pages or we have enough results, break
+                    if not next_page_token or len(channel_ids) >= max_results:
+                        break
+                        
+                else:
+                    print(f"Error searching for '{query}': {response.status_code}")
+                    break
+                    
+            except Exception as e:
+                print(f"Exception searching for '{query}': {e}")
+                break
         
-        return channel_ids
+        return channel_ids[:max_results]  # Ensure we don't exceed the requested amount
     
     def get_channel_info(self, channel_id: str) -> Dict:
         """Get detailed channel information"""
