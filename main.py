@@ -327,71 +327,161 @@ class YouTubeSheetsAnalyzer:
         except Exception as e:
             print(f"Error updating summary: {e}")
     
+    def search_channels(self, query: str, max_results: int = 100) -> List[str]:
+        """Search for channels and return channel IDs with pagination support and error handling"""
+        url = f"{self.base_url}/search"
+        channel_ids = []
+        next_page_token = None
+        results_per_page = min(50, max_results)  # API max is 50 per request
+        
+        while len(channel_ids) < max_results:
+            # Calculate how many results we still need
+            remaining_results = max_results - len(channel_ids)
+            current_page_size = min(results_per_page, remaining_results)
+            
+            params = {
+                'part': 'snippet',
+                'type': 'channel',
+                'q': query,
+                'maxResults': current_page_size,
+                'key': self.youtube_api_key
+            }
+            
+            # Add pagination token if we have one
+            if next_page_token:
+                params['pageToken'] = next_page_token
+            
+            try:
+                response = requests.get(url, params=params)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Extract channel IDs from this page
+                    for item in data['items']:
+                        if len(channel_ids) < max_results:
+                            channel_ids.append(item['snippet']['channelId'])
+                    
+                    # Check if there are more pages
+                    next_page_token = data.get('nextPageToken')
+                    
+                    # If no more pages or we have enough results, break
+                    if not next_page_token or len(channel_ids) >= max_results:
+                        break
+                        
+                elif response.status_code == 403:
+                    error_data = response.json()
+                    if 'quotaExceeded' in str(error_data):
+                        print(f"❌ QUOTA EXCEEDED for search term '{query}'. Stopping searches.")
+                        break
+                    else:
+                        print(f"❌ API Error for '{query}': {response.status_code} - {error_data}")
+                        break
+                        
+                else:
+                    print(f"❌ HTTP Error for '{query}': {response.status_code}")
+                    break
+                    
+            except Exception as e:
+                print(f"❌ Exception searching for '{query}': {e}")
+                break
+                
+            # Add delay between pagination requests
+            import time
+            time.sleep(1.0)  # Increased delay
+        
+        return channel_ids[:max_results]  # Ensure we don't exceed the requested amount
+
     def run_analysis(self):
-        """Main analysis workflow with batch processing"""
+        """Main analysis workflow with quota management"""
         print("Starting YouTube kids channel analysis...")
         
         # Get configuration from sheets
         config = self.get_input_from_sheets()
         print(f"Search terms: {config['search_terms']}")
+        print(f"Total search terms: {len(config['search_terms'])}")
         
         all_channel_ids = set()
+        search_count = 0
         
-        # Search for channels using each term
-        for term in config['search_terms']:
-            print(f"Searching for channels with term: {term}")
+        # Search for channels using each term with quota monitoring
+        for i, term in enumerate(config['search_terms']):
+            print(f"\n[{i+1}/{len(config['search_terms'])}] Searching for: '{term}'")
+            
             try:
                 channel_ids = self.search_channels(term, config['max_results_per_term'])
-                all_channel_ids.update(channel_ids)
-                print(f"Found {len(channel_ids)} channels for '{term}'")
                 
-                # Add small delay to avoid rate limiting
+                if not channel_ids:
+                    print(f"⚠️ No results for '{term}' - might have hit API limit")
+                    # Check if we should stop due to quota
+                    if search_count > 20:  # If we've done 20+ searches and getting no results
+                        print("🛑 Likely hit API quota limit. Proceeding with channels found so far.")
+                        break
+                else:
+                    all_channel_ids.update(channel_ids)
+                    print(f"✅ Found {len(channel_ids)} channels for '{term}' (Total unique: {len(all_channel_ids)})")
+                
+                search_count += 1
+                
+                # Add delay between search terms to avoid rate limiting
                 import time
-                time.sleep(0.5)
+                time.sleep(1.5)
                 
             except Exception as e:
-                print(f"Error searching for '{term}': {e}")
+                print(f"❌ Error searching for '{term}': {e}")
                 continue
         
-        print(f"Total unique channels to analyze: {len(all_channel_ids)}")
+        print(f"\n📊 Search phase complete!")
+        print(f"Total unique channels found: {len(all_channel_ids)}")
+        
+        if not all_channel_ids:
+            print("❌ No channels found to analyze. Check API quota or search terms.")
+            return
         
         # Get existing channels to avoid duplicates
+        print("🔍 Checking for existing channels...")
         existing_channel_ids = self.get_existing_channels()
         
         # Filter out channels we've already analyzed
         new_channel_ids = [cid for cid in all_channel_ids if cid not in existing_channel_ids]
-        print(f"New channels to analyze: {len(new_channel_ids)}")
+        print(f"📈 New channels to analyze: {len(new_channel_ids)} (Skipping {len(all_channel_ids) - len(new_channel_ids)} existing)")
         
         if not new_channel_ids:
-            print("No new channels to analyze!")
+            print("✅ No new channels to analyze - all channels were already in database!")
             return
         
-        # Analyze channels in batches and write results frequently
-        batch_size = 100
-        all_results = []
+        # Analyze channels in small batches with frequent saves
+        batch_size = 50  # Reduced batch size
+        total_added = 0
         
         for i in range(0, len(new_channel_ids), batch_size):
             batch = list(new_channel_ids)[i:i + batch_size]
             batch_num = (i // batch_size) + 1
             total_batches = (len(new_channel_ids) + batch_size - 1) // batch_size
             
-            print(f"\n--- Processing Batch {batch_num}/{total_batches} ({len(batch)} channels) ---")
+            print(f"\n🔄 Processing Batch {batch_num}/{total_batches} ({len(batch)} channels)")
             
             batch_results = []
             for j, channel_id in enumerate(batch):
                 global_index = i + j + 1
-                print(f"Analyzing channel {global_index}/{len(new_channel_ids)}")
+                
+                if global_index % 10 == 1:  # Print every 10th channel
+                    print(f"Analyzing channel {global_index}/{len(new_channel_ids)}")
                 
                 try:
                     result = self.analyze_channel(channel_id)
                     batch_results.append(result)
                     
-                    # Add small delay to avoid rate limiting
+                    # Add delay to avoid rate limiting
                     import time
-                    time.sleep(0.1)
+                    time.sleep(0.2)
                     
                 except Exception as e:
-                    print(f"Error analyzing channel {channel_id}: {e}")
+                    print(f"❌ Error analyzing channel {channel_id}: {e}")
+                    # Check if this is a quota error
+                    if 'quotaExceeded' in str(e) or '403' in str(e):
+                        print("🛑 Hit API quota during analysis. Saving progress and stopping.")
+                        break
                     continue
             
             # Filter and write this batch to sheets immediately
@@ -403,27 +493,29 @@ class YouTubeSheetsAnalyzer:
             
             if filtered_batch:
                 try:
+                    print(f"💾 Writing {len(filtered_batch)} kids channels to Google Sheets...")
                     self.write_batch_to_sheets(filtered_batch)
-                    print(f"✅ Wrote {len(filtered_batch)} kids channels from this batch to Google Sheets")
+                    total_added += len(filtered_batch)
+                    print(f"✅ Successfully wrote batch {batch_num}. Running total: {total_added} kids channels added.")
                 except Exception as e:
                     print(f"❌ Error writing batch to sheets: {e}")
+                    # Try to continue with next batch
+            else:
+                print(f"⚠️ No qualifying kids channels in batch {batch_num}")
             
-            all_results.extend(batch_results)
+            print(f"📊 Batch {batch_num} complete. Processed {i + len(batch)}/{len(new_channel_ids)} channels.")
             
-            print(f"Batch {batch_num} complete. Total channels processed so far: {i + len(batch)}")
+            # Add longer delay between batches
+            import time
+            time.sleep(2.0)
+        
+        print(f"\n🎉 Analysis complete! Added {total_added} new kids channels total.")
         
         # Update final summary
         try:
             sheet_id = os.environ['GOOGLE_SHEET_ID']
             spreadsheet = self.gc.open_by_key(sheet_id)
-            
-            total_new_added = sum(1 for r in all_results 
-                                if r.get('kids_content_score', 0) >= config['min_kids_score'] 
-                                and 'error' not in r)
-            
-            self.update_summary(spreadsheet, len(all_results), total_new_added, config)
-            print(f"\n🎉 Analysis complete! Added {total_new_added} new kids channels total.")
-            
+            self.update_summary(spreadsheet, len(new_channel_ids), total_added, config)
         except Exception as e:
             print(f"Error updating final summary: {e}")
     
